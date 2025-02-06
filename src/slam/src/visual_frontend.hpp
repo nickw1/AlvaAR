@@ -89,10 +89,6 @@ private:
 
     void kltTrackingFromMotionPrior();
 
-    void kltTrackingFromKeyframe();
-
-    void epipolar2d2dOutlierFiltering();
-
     bool computePose();
 
     // compute parallax (in px.) between current frame and the provided keyframe

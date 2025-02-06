@@ -26,11 +26,6 @@ void VisualFrontend::track(cv::Mat &image, double timestamp)
     {
         mapManager_->createKeyframe(currImage_, image);
 
-        if (state_->trackKeyframeToFrame_)
-        {
-            cv::buildOpticalFlowPyramid(currImage_, keyframePyramid_, state_->kltWinSize_, state_->kltPyramidLevels_);
-        }
-
         if (!state_->slamResetRequested_ && state_->slamReadyForInit_)
         {
             Keyframe kf(currFrame_->keyframeId_, image);
@@ -54,17 +49,7 @@ bool VisualFrontend::process(cv::Mat &image, double timestamp)
     motionModel_.applyMotionModel(Twc, timestamp);
     currFrame_->setTwc(Twc);
 
-    // Track the new image
-    if (state_->trackKeyframeToFrame_)
-    {
-        kltTrackingFromKeyframe();
-    }
-    else
-    {
-        kltTrackingFromMotionPrior();
-    }
-
-    //epipolar2d2dOutlierFiltering();
+    kltTrackingFromMotionPrior();
 
     if (!state_->slamReadyForInit_)
     {
@@ -73,16 +58,19 @@ bool VisualFrontend::process(cv::Mat &image, double timestamp)
             state_->slamResetRequested_ = true;
             return false;
         }
-        else if (checkReadyForInit())
+
+        if (checkReadyForInit())
         {
             state_->slamReadyForInit_ = true;
             return true;
         }
-        else
+
+        if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: Not ready for initialization\n";
-            return false;
+            std::cout << "- [Visual-Frontend]: Not ready for initialization" << std::endl;
         }
+
+        return false;
     }
     else
     {
@@ -90,7 +78,10 @@ bool VisualFrontend::process(cv::Mat &image, double timestamp)
 
         if (!success)
         {
-            std::cout << "- [Visual-Front-End]: Failed to compute pose num times: " << poseFailedCounter_ << std::endl;
+            if (state_->debug_)
+            {
+                std::cout << "- [Visual-Frontend]: Failed to compute pose num times: " << poseFailedCounter_ << std::endl;
+            }
 
             poseFailedCounter_++;
 
@@ -200,7 +191,7 @@ void VisualFrontend::kltTrackingFromMotionPrior()
 
         if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: KLT Tracking w. priors : " << numGood << " out of " << numKeypoints << " kps tracked!\n";
+            std::cout << "- [Visual-Frontend]: FromMotionPrior - w. priors : " << numGood << " out of " << numKeypoints << " kps tracked" << std::endl;
         }
 
         if (numGood < 0.33 * numKeypoints)
@@ -246,320 +237,8 @@ void VisualFrontend::kltTrackingFromMotionPrior()
 
         if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: KLT Tracking no prior : " << numGood << " out of " << numKeypoints << " kps tracked!\n";
+            std::cout << "- [Visual-Frontend]: FromMotionPrior - no prior : " << numGood << " out of " << numKeypoints << " kps tracked" << std::endl;
         }
-    }
-}
-
-void VisualFrontend::kltTrackingFromKeyframe()
-{
-    // Get current kps and init priors for tracking
-    std::vector<int> keyPoint3dIds;
-    std::vector<int> keyPointIds;
-    std::vector<cv::Point2f> keyPoints3d;
-    std::vector<cv::Point2f> priors3d;
-    std::vector<cv::Point2f> keyPoints;
-    std::vector<cv::Point2f> priors;
-    std::vector<bool> keypointIs3d;
-
-    // First track 3d kps on only 2 levels
-    keyPoint3dIds.reserve(currFrame_->numKeypoints3d_);
-    keyPoints3d.reserve(currFrame_->numKeypoints3d_);
-    priors3d.reserve(currFrame_->numKeypoints3d_);
-
-    // Then track 2d kps on full pyramid levels
-    keyPointIds.reserve(currFrame_->numKeypoints_);
-    keyPoints.reserve(currFrame_->numKeypoints_);
-    priors.reserve(currFrame_->numKeypoints_);
-    keypointIs3d.reserve(currFrame_->numKeypoints_);
-
-    // Get prev keyframe
-    auto pkf = mapManager_->mapKeyframes_.at(currFrame_->keyframeId_);
-
-    if (pkf == nullptr)
-    {
-        return;
-    }
-
-    std::vector<int> badIds;
-    badIds.reserve(currFrame_->numKeypoints_ * 0.2);
-
-    for (const auto &it: currFrame_->mapKeypoints_)
-    {
-        auto &keypoint = it.second;
-        auto kfkpit = pkf->mapKeypoints_.find(keypoint.keypointId_);
-
-        if (kfkpit == pkf->mapKeypoints_.end())
-        {
-            badIds.push_back(keypoint.keypointId_);
-            continue;
-        }
-
-        // Init prior px pos. from motion model
-        if (state_->kltUsePrior_)
-        {
-            if (keypoint.is3d_)
-            {
-                cv::Point2f projpx = currFrame_->projWorldToImageDist(mapManager_->mapMapPoints_.at(keypoint.keypointId_)->getPoint());
-
-                // Add prior if projected into image
-                if (currFrame_->isInImage(projpx))
-                {
-                    keyPoints3d.push_back(kfkpit->second.px_);
-                    priors3d.push_back(projpx);
-                    keyPoint3dIds.push_back(keypoint.keypointId_);
-                    keypointIs3d.push_back(true);
-                    continue;
-                }
-            }
-        }
-
-        // For other kps init prior with prev px pos.
-        keyPointIds.push_back(keypoint.keypointId_);
-        keyPoints.push_back(kfkpit->second.px_);
-        priors.push_back(keypoint.px_);
-    }
-
-    for (const auto &id: badIds)
-    {
-        mapManager_->removeObsFromCurrFrameById(id);
-    }
-
-    // 1st track 3d key points if using priors
-    if (state_->kltUsePrior_ && !priors3d.empty())
-    {
-        // Good / bad kps vector
-        std::vector<bool> keyPointStatus;
-
-        auto vprior = priors3d;
-
-        featureTracker_->fbKltTracking(
-                keyframePyramid_,
-                currPyramid_,
-                state_->kltWinSizeWH_,
-                1,
-                state_->kltError_,
-                state_->kltMaxFbDistance_,
-                keyPoints3d,
-                priors3d,
-                keyPointStatus);
-
-        size_t numGood = 0;
-        size_t numKeypoints = keyPoints3d.size();
-
-        for (size_t i = 0; i < numKeypoints; i++)
-        {
-            if (keyPointStatus.at(i))
-            {
-                currFrame_->updateKeypoint(keyPoint3dIds.at(i), priors3d.at(i));
-                numGood++;
-            }
-            else
-            {
-                // If tracking failed, try full pyramid size
-                keyPointIds.push_back(keyPoint3dIds.at(i));
-                keyPoints.push_back(keyPoints3d.at(i));
-                priors.push_back(currFrame_->mapKeypoints_.at(keyPoint3dIds.at(i)).px_);
-            }
-        }
-
-        if (state_->debug_)
-        {
-            std::cout << "- [Visual-Front-End]: KLT Tracking w. priors : " << numGood << " out of " << numKeypoints << " kps tracked!\n";
-        }
-
-        if (numGood < 0.33 * numKeypoints)
-        {
-            // Motion model might be quite wrong, P3P is recommended next and not using any prior
-            p3pReq_ = true;
-            priors = keyPoints;
-        }
-    }
-
-    // 2nd track other key points if any
-    if (!keyPoints.empty())
-    {
-        // Good / bad kps vector
-        std::vector<bool> keypointStatus;
-
-        featureTracker_->fbKltTracking(
-                keyframePyramid_,
-                currPyramid_,
-                state_->kltWinSizeWH_,
-                state_->kltPyramidLevels_,
-                state_->kltError_,
-                state_->kltMaxFbDistance_,
-                keyPoints,
-                priors,
-                keypointStatus);
-
-        size_t numGood = 0;
-        size_t numKeypoints = keyPoints.size();
-
-        for (size_t i = 0; i < numKeypoints; i++)
-        {
-            if (keypointStatus.at(i))
-            {
-                currFrame_->updateKeypoint(keyPointIds.at(i), priors.at(i));
-                numGood++;
-            }
-            else
-            {
-                mapManager_->removeObsFromCurrFrameById(keyPointIds.at(i));
-            }
-        }
-
-        if (state_->debug_)
-        {
-            std::cout << "- [Visual-Front-End]: KLT Tracking no prior : " << numGood << " out of " << numKeypoints << " kps tracked!\n";
-        }
-    }
-}
-
-void VisualFrontend::epipolar2d2dOutlierFiltering()
-{
-    auto keyframe = mapManager_->mapKeyframes_.at(currFrame_->keyframeId_);
-
-    if (keyframe == nullptr)
-    {
-        std::cerr << "- [Visual-Front-End]: ERROR! Previous Kf does not exist yet (epipolar2d2d()).\n";
-        exit(-1);
-    }
-
-    // Get current frame number kps
-    size_t numKeypoints = currFrame_->numKeypoints_;
-
-    if (numKeypoints < 8)
-    {
-        std::cout << "- [Visual-Front-End]: Not enough kps to compute Essential Matrix" << std::endl;
-        return;
-    }
-
-    // Setup Essential Matrix computation for OpenGV-based filtering
-    std::vector<int> keypointIds;
-    std::vector<int> outliersIndices;
-    keypointIds.reserve(numKeypoints);
-    outliersIndices.reserve(numKeypoints);
-
-    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d> > vkfbvs;
-    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d> > vcurbvs;
-    vkfbvs.reserve(numKeypoints);
-    vcurbvs.reserve(numKeypoints);
-
-    size_t numParallax = 0;
-    float avgParallax = 0.;
-
-    // Compute rotation compensated parallax
-    Eigen::Matrix3d Rkfcur = keyframe->getRcw() * currFrame_->getRwc();
-
-    // Init bearing vectors and check parallax
-    for (const auto &it: currFrame_->mapKeypoints_)
-    {
-        auto &keypoint = it.second;
-
-        // Get the prev keyframe related kp if it exists
-        auto keyframeKeypoint = keyframe->getKeypointById(keypoint.keypointId_);
-
-        if (keyframeKeypoint.keypointId_ != keypoint.keypointId_)
-        {
-            continue;
-        }
-
-        // Store the bvs and their ids
-        vkfbvs.push_back(keyframeKeypoint.bv_);
-        vcurbvs.push_back(keypoint.bv_);
-        keypointIds.push_back(keypoint.keypointId_);
-
-        cv::Point2f rotPx = keyframe->projCamToImage(Rkfcur * keypoint.bv_);
-
-        // Compute parallax
-        avgParallax += cv::norm(rotPx - keyframeKeypoint.unpx_);
-        numParallax++;
-    }
-
-    // Average parallax
-    avgParallax /= numParallax;
-
-    if (avgParallax < 2.0 * state_->multiViewRansacError_)
-    {
-        if (state_->debug_)
-        {
-            std::cout << "- [Visual-Front-End]: Not enough parallax (" << avgParallax << " px) to compute 5-pt Essential Matrix\n";
-        }
-        return;
-    }
-
-    bool doOptimize = false;
-
-    // use the resulting motion if tracking is poor
-    if (mapManager_->numKeyframes_ > 2 && currFrame_->numKeypoints3d_ < 30)
-    {
-        doOptimize = true;
-    }
-
-    Eigen::Matrix3d Rkfc;
-    Eigen::Vector3d tkfc;
-
-    if (state_->debug_)
-    {
-        std::cout << "\n \t>>> 5-pt EssentialMatrix Ransac :";
-        std::cout << "\n \t>>> nb pts : " << numKeypoints;
-        std::cout << " / avg. parallax : " << avgParallax;
-        std::cout << " / ransac_iterations : " << state_->multiViewRansacNumIterations_;
-        std::cout << " / ransac_error : " << state_->multiViewRansacError_;
-        std::cout << "\n\n";
-    }
-
-    bool success = MultiViewGeometry::compute5ptEssentialMatrix(
-            vkfbvs,
-            vcurbvs,
-            state_->multiViewRansacNumIterations_,
-            state_->multiViewRansacError_,
-            doOptimize,
-            state_->multiViewRandomEnabled_,
-            currFrame_->cameraCalibration_->fx_,
-            currFrame_->cameraCalibration_->fy_,
-            Rkfc,
-            tkfc,
-            outliersIndices);
-
-    if (state_->debug_)
-    {
-        std::cout << "- [Visual-Front-End]: Epipolar nb outliers : " << outliersIndices.size();
-    }
-
-    if (!success)
-    {
-        std::cout << "- [Visual-Front-End]: No pose could be computed from 5-pt EssentialMatrix" << std::endl;
-        return;
-    }
-
-    if (outliersIndices.size() > 0.5 * vkfbvs.size())
-    {
-        std::cout << "- [Visual-Front-End]: Too many outliers, skipping as might be degenerate case" << std::endl;
-        return;
-    }
-
-    // Remove outliers
-    for (const auto &idx: outliersIndices)
-    {
-        mapManager_->removeObsFromCurrFrameById(keypointIds.at(idx));
-    }
-
-    // In case we wanted to use the resulting motion (can help when tracking is poor)
-    if (doOptimize && mapManager_->numKeyframes_ > 2)
-    {
-        // Get motion model translation scale from last keyframe
-        Sophus::SE3d Tkfw = keyframe->getTcw();
-        Sophus::SE3d Tkfcur = Tkfw * currFrame_->getTwc();
-
-        double scale = Tkfcur.translation().norm();
-        tkfc.normalize();
-
-        // Update current pose with Essential Mat. relative motion and current trans. scale
-        Sophus::SE3d Tkfc(Rkfc, scale * tkfc);
-
-        currFrame_->setTwc(keyframe->getTwc() * Tkfc);
     }
 }
 
@@ -571,7 +250,7 @@ bool VisualFrontend::computePose()
     {
         if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: Not enough kps to compute P3P/PnP\n";
+            std::cout << "- [Visual-Frontend]: Pose - Not enough kps to compute P3P/PnP" << std::endl;
         }
 
         return false;
@@ -624,15 +303,6 @@ bool VisualFrontend::computePose()
 
     if (doP3P)
     {
-        if (state_->debug_)
-        {
-            std::cout << "\n \t>>>P3P Ransac : ";
-            std::cout << "\n \t>>> nb 3d pts : " << num3dKeypoints;
-            std::cout << " / ransac_iterations : " << state_->multiViewRansacNumIterations_;
-            std::cout << " / ransac_error : " << state_->multiViewRansacError_;
-            std::cout << "\n\n";
-        }
-
         success = MultiViewGeometry::p3pRansac(
                 vbvs,
                 vwpts,
@@ -643,13 +313,12 @@ bool VisualFrontend::computePose()
                 currFrame_->cameraCalibration_->fx_,
                 currFrame_->cameraCalibration_->fy_,
                 Twc,
-                outliersIndices,
-                true //use meds, only effective with OpenGV
+                outliersIndices
         );
 
         if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: P3P-LMeds nb outliers : " << outliersIndices.size();
+            std::cout << "- [Visual-Frontend]: Pose - P3P num outliers : " << outliersIndices.size() << std::endl;
         }
 
         // Check that pose estimation was good enough
@@ -659,7 +328,7 @@ bool VisualFrontend::computePose()
         {
             if (state_->debug_)
             {
-                std::cout << "- [Visual-Front-End]: Not enough inliers for reliable pose est. Resetting keyframe state\n";
+                std::cout << "- [Visual-Frontend]: Pose - Not enough inliers for reliable pose est. Resetting keyframe state" << std::endl;
             }
 
             resetFrame();
@@ -667,12 +336,12 @@ bool VisualFrontend::computePose()
             return false;
         }
 
-        // pose seems to be OK!
+        // pose seems to be OK
 
         // update frame pose
         currFrame_->setTwc(Twc);
 
-        // Remove outliers before PnP refinement (a bit dirty)
+        // Remove outliers before PnP refinement
         int k = 0;
         for (const auto &index: outliersIndices)
         {
@@ -710,7 +379,7 @@ bool VisualFrontend::computePose()
 
     if (state_->debug_)
     {
-        std::cout << "- [Visual-Front-End]: Ceres PnP outliers : " << outliersIndices.size() << ", inliers: " << numInliers << "\n";
+        std::cout << "- [Visual-Frontend]: Pose - Ceres PnP outliers : " << outliersIndices.size() << ", inliers: " << numInliers << std::endl;
     }
 
     if (!success || numInliers < 5 || outliersIndices.size() > 0.5 * vwpts.size() || Twc.translation().array().isInf().any() || Twc.translation().array().isNaN().any())
@@ -723,7 +392,7 @@ bool VisualFrontend::computePose()
 
         if (state_->debug_)
         {
-            std::cout << "- [Visual-Front-End]: Not enough inliers for reliable pose est. Resetting keyframe state\n";
+            std::cout << "- [Visual-Frontend]: Pose - Not enough inliers for reliable pose est. Resetting keyframe state" << std::endl;
         }
 
         resetFrame();
@@ -767,7 +436,11 @@ bool VisualFrontend::checkReadyForInit()
 
     if (numKeypoints < 8)
     {
-        std::cout << "- [Visual-Front-End]: Can't compute 5-pt Essential matrix. Not enough keypoints.\n";
+        if (state_->debug_)
+        {
+            std::cout << "- [Visual-Frontend]: CheckReady - Can't compute 5-pt Essential matrix. Not enough keypoints" << std::endl;
+        }
+
         return false;
     }
 
@@ -815,7 +488,11 @@ bool VisualFrontend::checkReadyForInit()
 
     if (numParallax < 8)
     {
-        std::cout << "- [Visual-Front-End]: Can't compute 5-pt Essential matrix. Not enough prev keyframe keypoints.\n";
+        if (state_->debug_)
+        {
+            std::cout << "- [Visual-Frontend]: CheckReady - Can't compute 5-pt Essential matrix. Not enough keypoints in prev keyframe" << std::endl;
+        }
+
         return false;
     }
 
@@ -824,14 +501,18 @@ bool VisualFrontend::checkReadyForInit()
 
     if (avgRotParallax < state_->minAvgRotationParallax_)
     {
-        std::cout << "- [Visual-Front-End]: Can't compute 5-pt Essential matrix. Not enough parallax " << avgRotParallax << " px)\n";
+        if (state_->debug_)
+        {
+            std::cout << "- [Visual-Frontend]: CheckReady - Can't compute 5-pt Essential matrix. Not enough parallax " << avgRotParallax << " px)" << std::endl;
+        }
+
         return false;
     }
 
-    Eigen::Matrix3d Rkfc;
-    Eigen::Vector3d tkfc;
-    Rkfc.setIdentity();
-    tkfc.setZero();
+    Eigen::Matrix3d Rwc;
+    Eigen::Vector3d twc;
+    Rwc.setIdentity();
+    twc.setZero();
 
     bool success = MultiViewGeometry::compute5ptEssentialMatrix(
             vkfbvs,
@@ -842,27 +523,30 @@ bool VisualFrontend::checkReadyForInit()
             state_->multiViewRandomEnabled_,
             currFrame_->cameraCalibration_->fx_,
             currFrame_->cameraCalibration_->fy_,
-            Rkfc,
-            tkfc,
+            Rwc,
+            twc,
             outliersIndices);
 
     if (!success)
     {
-        std::cout << "- [Visual-Front-End]: 5-pt Essential Matrix failed.\n";
+        if (state_->debug_)
+        {
+            std::cout << "- [Visual-Frontend]: CheckReady - 5-pt Essential Matrix failed" << std::endl;
+        }
+
         return false;
     }
 
     // Remove outliers from current frame
-    for (const auto &idx: outliersIndices)
+    for (const auto &index: outliersIndices)
     {
-        mapManager_->removeObsFromCurrFrameById(keypointIds.at(idx));
+        mapManager_->removeObsFromCurrFrameById(keypointIds.at(index));
     }
 
-    //Normalize the translation scale.
-    tkfc.normalize();
-    //tkfc = tkfc.eval() * 1.0;
+    // Normalize the translation scale
+    twc.normalize();
 
-    currFrame_->setTwc(Rkfc, tkfc);
+    currFrame_->setTwc(Rwc, twc);
 
     return true;
 }
@@ -988,10 +672,7 @@ float VisualFrontend::computeParallax(const int keyframeId, bool doUnRotate, boo
 void VisualFrontend::preprocessImage(cv::Mat &image)
 {
     // update prev image
-    if (!state_->trackKeyframeToFrame_)
-    {
-        cv::swap(currImage_, prevImage_);
-    }
+    cv::swap(currImage_, prevImage_);
 
     // update curr image
     if (state_->claheEnabled_)
@@ -1007,7 +688,7 @@ void VisualFrontend::preprocessImage(cv::Mat &image)
     if (state_->kltEnabled_)
     {
         // If tracking from prev image, swap the pyramid
-        if (!currPyramid_.empty() && !state_->trackKeyframeToFrame_)
+        if (!currPyramid_.empty())
         {
             prevPyramid_.swap(currPyramid_);
         }
