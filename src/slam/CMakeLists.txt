@@ -25,7 +25,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif (NOT CMAKE_BUILD_TYPE)
 
 # Set dist directory, if not defined
-# TODO NOTE the built file needs to be copied to the 'alva-jsutils' src directory to be included in the npm package
+# TODO NOTE the built file needs to be copied to the 'js/src' src directory to be included in the npm package
 if (NOT DIST_DIR)
     message(STATUS "DIST_DIR not set. Using './dist'")
     set(DIST_DIR ${CMAKE_BINARY_DIR}/../../../dist)
