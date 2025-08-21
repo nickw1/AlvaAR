@@ -1,0 +1,9 @@
+{
+    "dependencies": {
+        "three":"0.132.0",
+        "alva-js": "file:../../js/alva-js-0.0.1.tgz"
+    },
+    "devDependencies": {
+        "vite": "^7.1.3"
+    }
+}
